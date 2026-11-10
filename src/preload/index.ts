@@ -22,7 +22,18 @@ contextBridge.exposeInMainWorld('repoDesk', {
     refresh: () => ipcRenderer.invoke('repositories:refresh'),
     refreshOne: (repoPath: string) => ipcRenderer.invoke('repositories:refresh-one', repoPath),
     openFolder: (repoPath: string) => ipcRenderer.invoke('repositories:open-folder', repoPath),
-    action: (repoPath: string, action: 'pull' | 'push') => ipcRenderer.invoke('repositories:git-action', repoPath, action)
+    openRemote: (repoPath: string) => ipcRenderer.invoke('repositories:open-remote', repoPath),
+    action: (repoPath: string, action: 'pull' | 'push') => ipcRenderer.invoke('repositories:git-action', repoPath, action),
+    stage: (repoPath: string, files: string[]) => ipcRenderer.invoke('repositories:stage', repoPath, files),
+    unstage: (repoPath: string, files: string[]) => ipcRenderer.invoke('repositories:unstage', repoPath, files),
+    diff: (repoPath: string, file: string, staged: boolean) => ipcRenderer.invoke('repositories:diff', repoPath, file, staged),
+    commit: (repoPath: string, message: string) => ipcRenderer.invoke('repositories:commit', repoPath, message)
   },
-  history: { list: () => ipcRenderer.invoke('history:list') }
+  history: { list: () => ipcRenderer.invoke('history:list') },
+  documents: {
+    list: () => ipcRenderer.invoke('documents:list'),
+    save: (document: RepoDeskLibraryDocument) => ipcRenderer.invoke('documents:save', document),
+    delete: (id: string) => ipcRenderer.invoke('documents:delete', id),
+    publish: (id: string, repoPaths: string[], destination: string, overwrite: boolean) => ipcRenderer.invoke('documents:publish', id, repoPaths, destination, overwrite)
+  }
 })

@@ -19,6 +19,20 @@ if not exist "node_modules\electron-vite\bin\electron-vite.js" (
   )
 )
 
+if not exist "node_modules\electron\dist\electron.exe" goto install_electron
+if not exist "node_modules\electron\path.txt" goto install_electron
+goto start_app
+
+:install_electron
+  echo Repairing Electron runtime configuration...
+  node src\install-electron.cjs
+  if errorlevel 1 (
+    echo Electron runtime installation failed.
+    pause
+    exit /b 1
+  )
+
+:start_app
 call npm run dev
 if errorlevel 1 pause
 endlocal
