@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('repoDesk', {
     commit: (repoPath: string, message: string) => ipcRenderer.invoke('repositories:commit', repoPath, message)
   },
   history: { list: () => ipcRenderer.invoke('history:list') },
+  git: { identity: (repoPath?: string) => ipcRenderer.invoke('git:identity', repoPath) },
   documents: {
     list: () => ipcRenderer.invoke('documents:list'),
     save: (document: RepoDeskLibraryDocument) => ipcRenderer.invoke('documents:save', document),

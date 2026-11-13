@@ -75,32 +75,55 @@ async function git(cwd: string, args: string[]) {
     throw new Error(detail.stderr?.trim() || detail.message)
   }
 }
+function parsePorcelainStatus(output: string) {
+  const entries = output.split('\0').filter(Boolean)
+  const files: Array<{ path: string; status: string; staged: boolean; unstaged: boolean }> = []
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]
+    const code = entry.slice(0, 2)
+    files.push({ path: entry.slice(3), status: code.trim() || '未跟踪', staged: code[0] !== ' ' && code[0] !== '?', unstaged: code[1] !== ' ' || code[0] === '?' })
+    if (code.includes('R') || code.includes('C')) index++
+  }
+  return files
+}
+async function getOperationState(repoPath: string) {
+  const markers: Array<[string, string]> = [['MERGE_HEAD', '合并中'], ['CHERRY_PICK_HEAD', '拣选提交中'], ['REVERT_HEAD', '撤销提交中']]
+  for (const [marker, label] of markers) {
+    const markerPath = await git(repoPath, ['rev-parse', '--git-path', marker]).catch(() => '')
+    if (markerPath) try { await fs.access(resolve(repoPath, markerPath)); return label } catch { /* marker absent */ }
+  }
+  for (const marker of ['rebase-merge', 'rebase-apply']) {
+    const markerPath = await git(repoPath, ['rev-parse', '--git-path', marker]).catch(() => '')
+    if (markerPath) try { await fs.access(resolve(repoPath, markerPath)); return '变基中' } catch { /* marker absent */ }
+  }
+  return ''
+}
 async function scanRepositories(root: string, maxDepth: number) {
-  const repos: Array<{ name: string; path: string; branch: string; changes: number; staged: number; lastCommit: string; lastCommitAt: string; lastCommitEpoch: number; files: Array<{ path: string; status: string; staged: boolean; unstaged: boolean }>; commits: Array<{ hash: string; subject: string; date: string }>; upstream: string; remoteUrl: string; ahead: number; behind: number; remoteState: string; remoteError: string; frozen: boolean }> = []
+  const repos: Array<{ name: string; path: string; branch: string; changes: number; staged: number; lastCommit: string; lastCommitAt: string; lastCommitEpoch: number; files: Array<{ path: string; status: string; staged: boolean; unstaged: boolean }>; commits: Array<{ hash: string; subject: string; date: string }>; upstream: string; remoteUrl: string; ahead: number; behind: number; remoteState: string; remoteError: string; remoteCheckedAt: string; operationState: string; frozen: boolean }> = []
   const ignored = new Set(['node_modules', '.npm', '.cache', 'dist', 'build', 'coverage', 'vendor'])
   async function walk(dir: string, depth: number): Promise<void> {
     let entries
     try { entries = await fs.readdir(dir, { withFileTypes: true }) } catch { return }
     if (entries.some(entry => entry.name === '.git')) {
       try {
-        const [branch, status, lastCommit, lastCommitAt, lastCommitEpoch, log, remoteUrl] = await Promise.all([
+        const [branch, status, lastCommit, lastCommitAt, lastCommitEpoch, log, remoteUrl, operationState] = await Promise.all([
           git(dir, ['branch', '--show-current']).then(value => value || '(detached)'),
-          git(dir, ['status', '--porcelain=v1']),
+          git(dir, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-z']),
           git(dir, ['log', '-1', '--pretty=%s']).catch(() => ''),
           git(dir, ['log', '-1', '--pretty=%cr']).catch(() => ''),
           git(dir, ['log', '-1', '--pretty=%ct']).then(Number).catch(() => 0),
           git(dir, ['log', '-5', '--pretty=%h%x1f%s%x1f%cr']).catch(() => ''),
-          git(dir, ['remote', 'get-url', 'origin']).catch(() => '')
+          git(dir, ['remote', 'get-url', 'origin']).catch(() => ''),
+          getOperationState(dir)
         ])
-        const statusLines = status.split(/\r?\n/).filter(Boolean)
-        const files = statusLines.map(line => ({ path: line.slice(3), status: line.slice(0, 2).trim() || '未跟踪', staged: line[0] !== ' ' && line[0] !== '?', unstaged: line[1] !== ' ' || line[0] === '?' }))
+        const files = parsePorcelainStatus(status)
         const commits = log.split(/\r?\n/).filter(Boolean).map(line => { const [hash, subject, date] = line.split('\x1f'); return { hash, subject, date } })
         const upstream = await git(dir, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']).catch(() => '')
         const counts = upstream ? await git(dir, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`]).catch(() => '') : ''
         const [aheadRaw, behindRaw] = counts.split(/\s+/)
         const ahead = Number(aheadRaw) || 0
         const behind = Number(behindRaw) || 0
-        repos.push({ name: basename(dir), path: dir, branch, changes: files.length, staged: statusLines.filter(line => line[0] !== ' ' && line[0] !== '?').length, lastCommit, lastCommitAt, lastCommitEpoch, files, commits, upstream, remoteUrl, ahead, behind, remoteState: !upstream ? 'no-upstream' : ahead && behind ? 'diverged' : ahead ? 'ahead' : behind ? 'behind' : 'synced', remoteError: '', frozen: false })
+        repos.push({ name: basename(dir), path: dir, branch, changes: files.length, staged: files.filter(file => file.staged).length, lastCommit, lastCommitAt, lastCommitEpoch, files, commits, upstream, remoteUrl, ahead, behind, remoteState: !upstream ? 'no-upstream' : ahead && behind ? 'diverged' : ahead ? 'ahead' : behind ? 'behind' : 'synced', remoteError: '', remoteCheckedAt: '', operationState, frozen: false })
       } catch { /* invalid or unavailable repositories are omitted from this first scan */ }
       return
     }
@@ -122,6 +145,7 @@ async function refreshRemoteStates() {
       const repo = repos[cursor++]
       if (frozen.has(repo.path)) continue
       try {
+        repo.remoteCheckedAt = new Date().toISOString()
         await git(repo.path, ['fetch', '--prune'])
         const upstream = await git(repo.path, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']).catch(() => '')
         repo.upstream = upstream
@@ -151,6 +175,7 @@ async function refreshOneRepository(repoPath: string) {
   const repo = repos.find(item => item.path === repoPath)
   if (!repo) throw new Error('仓库不在当前扫描目录中，请先重新扫描。')
   try {
+    repo.remoteCheckedAt = new Date().toISOString()
     await git(repo.path, ['fetch', '--prune'])
     repo.upstream = await git(repo.path, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']).catch(() => '')
     if (!repo.upstream) repo.remoteState = 'no-upstream'
@@ -235,6 +260,18 @@ function createWindow() {
   ipcMain.handle('history:list', async () => {
     try { return JSON.parse(await fs.readFile(historyPath(), 'utf8')) as OperationRecord[] } catch { return [] }
   })
+  ipcMain.handle('git:identity', async (_event, repoPath?: string) => {
+    const settings = await readSettings()
+    const globalName = await git(app.getPath('userData'), ['config', '--global', '--get', 'user.name']).catch(() => '')
+    const globalEmail = await git(app.getPath('userData'), ['config', '--global', '--get', 'user.email']).catch(() => '')
+    if (!repoPath) return { globalName, globalEmail, name: globalName, email: globalEmail, source: 'global' as const }
+    const repo = await resolveRepositoryPath(repoPath, settings)
+    const localName = await git(repo, ['config', '--local', '--get', 'user.name']).catch(() => '')
+    const localEmail = await git(repo, ['config', '--local', '--get', 'user.email']).catch(() => '')
+    const name = await git(repo, ['config', '--get', 'user.name']).catch(() => '')
+    const email = await git(repo, ['config', '--get', 'user.email']).catch(() => '')
+    return { globalName, globalEmail, name, email, source: localName || localEmail ? 'repository' as const : 'global' as const }
+  })
   ipcMain.handle('documents:list', () => readDocuments())
   ipcMain.handle('documents:save', async (_event, document: LibraryDocument) => {
     if (!document?.id || !document.name?.trim() || !document.fileName?.trim() || typeof document.content !== 'string') throw new Error('文档名称、文件名或内容格式无效。')
@@ -301,7 +338,10 @@ function createWindow() {
     }
     return { published, unchanged, conflicts: [] as string[] }
   })
-  ipcMain.handle('repositories:open-folder', (_event, repoPath: string) => shell.openPath(repoPath))
+  ipcMain.handle('repositories:open-folder', async (_event, repoPath: string) => {
+    const repo = await resolveRepositoryPath(repoPath, await readSettings())
+    return shell.openPath(repo)
+  })
   ipcMain.handle('repositories:open-remote', async (_event, repoPath: string) => {
     const settings = await readSettings()
     const repo = await resolveRepositoryPath(repoPath, settings)
@@ -365,25 +405,28 @@ function createWindow() {
     }
   })
   ipcMain.handle('repositories:git-action', async (_event, repoPath: string, action: 'pull' | 'push') => {
-    let name = basename(repoPath)
+    let name = basename(typeof repoPath === 'string' ? repoPath : '')
     try {
       const settings = await readSettings()
-      if (settings.frozen?.includes(repoPath)) throw new Error('此项目已冻结远程检查，请先解除冻结。')
-      await git(repoPath, ['fetch', '--prune'])
-      const status = await git(repoPath, ['status', '--porcelain=v1'])
+      if (action !== 'pull' && action !== 'push') throw new Error('Git 操作类型无效。')
+      const repo = await resolveRepositoryPath(repoPath, settings)
+      name = basename(repo)
+      if (settings.frozen?.includes(repo)) throw new Error('此项目已冻结远程检查，请先解除冻结。')
+      await git(repo, ['fetch', '--prune'])
+      const status = await git(repo, ['status', '--porcelain=v1', '-z'])
       if (action === 'pull' && status) throw new Error('工作区存在未提交改动。请先处理改动，再执行拉取。')
-      const upstream = await git(repoPath, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']).catch(() => '')
+      const upstream = await git(repo, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']).catch(() => '')
       if (!upstream) throw new Error('当前分支没有配置远程跟踪分支。')
-      const counts = await git(repoPath, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`])
+      const counts = await git(repo, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`])
       const [ahead, behind] = counts.split(/\s+/).map(Number)
       if (action === 'pull') {
         if (!behind) throw new Error('远程没有可拉取的提交。')
         if (ahead) throw new Error('本地与远程已分叉；请先手动处理分支。')
-        await git(repoPath, ['pull', '--ff-only'])
+        await git(repo, ['pull', '--ff-only'])
       } else {
         if (!ahead) throw new Error('本地没有待推送的提交。')
         if (behind) throw new Error('远程包含本地尚未整合的提交；请先拉取并处理分支。')
-        await git(repoPath, ['push'])
+        await git(repo, ['push'])
       }
       await appendHistory({ id: `${Date.now()}-${repoPath}`, at: new Date().toISOString(), repository: repoPath, name, action: action === 'pull' ? 'Pull' : 'Push', result: 'success', message: '操作成功' })
       return true
